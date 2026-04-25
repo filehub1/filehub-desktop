@@ -1,0 +1,43 @@
+indexedDirectories:
+useAdminMode: false
+address: 127.0.0.1:6543
+excludePatterns:
+  - tmp
+  - temp
+  - cache
+  - .pnpm-store
+  - .DS_Store
+  - .angular
+  - .sfdx
+  - dist
+  - pip-wheel-metadata
+  - .pytest_cache
+  - __pycache__
+  - node_modules
+  - .git
+  - .svn
+  - .hg
+  - .idea
+  - .vscode
+  - vendor
+  - bower_components
+  - jspm_packages
+  - '-*.log'
+  - '*.egg-info'
+  - ~$*.xlsx
+  - '*.swp'
+  - '*.class'
+  - '*.pyc'
+  - '*.pyo'
+  - '*.exe'
+  - '*.dll'
+  - '*.so'
+  - '*.dylib'
+  - '*~'
+  - .keep
+  - Thumbs.db
+  - desktop.ini
+theme: dark
+lanEnabled: false
+lanUser: ''
+lanPass: ''
