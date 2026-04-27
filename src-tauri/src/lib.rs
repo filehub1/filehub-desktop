@@ -22,9 +22,12 @@ fn find_free_port(start: u16) -> u16 {
 }
 
 /// Start a TCP proxy on 0.0.0.0 that forwards to 127.0.0.1:main_port.
+/// For HTTP requests, adds X-FileHub-LAN-Client header to distinguish LAN clients.
 /// Returns the LAN port it bound to.
 async fn start_lan_proxy(main_port: u16) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
     let listener = TcpListener::bind(("0.0.0.0", 0)).await.unwrap();
     let lan_port = listener.local_addr().unwrap().port();
     tokio::spawn(async move {
@@ -32,11 +35,76 @@ async fn start_lan_proxy(main_port: u16) -> u16 {
             let Ok((mut client, _)) = listener.accept().await else { break };
             tokio::spawn(async move {
                 let Ok(mut server) = tokio::net::TcpStream::connect(("127.0.0.1", main_port)).await else { return };
-                let (mut cr, mut cw) = client.split();
-                let (mut sr, mut sw) = server.split();
-                tokio::select! {
-                    _ = tokio::io::copy(&mut cr, &mut sw) => {}
-                    _ = tokio::io::copy(&mut sr, &mut cw) => {}
+
+                let mut first_bytes = [0u8; 16];
+                let bytes_read = match client.peek(&mut first_bytes).await {
+                    Ok(n) if n > 0 => n,
+                    _ => {
+                        // Fallback to simple proxy
+                        let (mut cr, mut cw) = client.split();
+                        let (mut sr, mut sw) = server.split();
+                        let _ = tokio::io::copy(&mut cr, &mut sw).await;
+                        let _ = tokio::io::copy(&mut sr, &mut cw).await;
+                        return;
+                    }
+                };
+
+                let request_start = String::from_utf8_lossy(&first_bytes[..bytes_read]);
+                let is_http = request_start.starts_with("GET ")
+                    || request_start.starts_with("POST ")
+                    || request_start.starts_with("PUT ")
+                    || request_start.starts_with("DELETE ")
+                    || request_start.starts_with("HEAD ")
+                    || request_start.starts_with("OPTIONS ");
+
+                if is_http {
+                    // Must consume the peeked data first
+                    let mut consume_buf = vec![0u8; 8192];
+                    let consumed = client.read(&mut consume_buf).await.unwrap_or(0);
+                    consume_buf.truncate(consumed);
+                    consume_buf.shrink_to_fit();
+
+                    let consume_str = String::from_utf8_lossy(&consume_buf);
+                    let modified = if !consume_str.contains("X-FileHub-LAN-Client:") {
+                        if let Some(pos) = consume_str.find("\r\n\r\n") {
+                            let header_end = pos + 2;
+                            let mut new_req = Vec::new();
+                            new_req.extend_from_slice(&consume_buf[..header_end]);
+                            new_req.extend_from_slice(b"X-FileHub-LAN-Client: true\r\n");
+                            new_req.extend_from_slice(&consume_buf[header_end..]);
+                            new_req
+                        } else {
+                            consume_buf
+                        }
+                    } else {
+                        consume_buf
+                    };
+
+                    // Forward modified request to server
+                    let mut offset = 0;
+                    while offset < modified.len() {
+                        match server.write(&modified[offset..]).await {
+                            Ok(0) => break,
+                            Ok(n) => offset += n,
+                            Err(_) => break,
+                        }
+                    }
+                    
+                    // Then bidirectionally copy
+                    let (mut cr, mut cw) = client.split();
+                    let (mut sr, mut sw) = server.split();
+                    tokio::select! {
+                        _ = tokio::io::copy(&mut cr, &mut sw) => {}
+                        _ = tokio::io::copy(&mut sr, &mut cw) => {}
+                    }
+                } else {
+                    // Non-HTTP, simple proxy
+                    let (mut cr, mut cw) = client.split();
+                    let (mut sr, mut sw) = server.split();
+                    tokio::select! {
+                        _ = tokio::io::copy(&mut cr, &mut sw) => {}
+                        _ = tokio::io::copy(&mut sr, &mut cw) => {}
+                    }
                 }
             });
         }

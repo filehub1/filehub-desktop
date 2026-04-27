@@ -169,8 +169,15 @@ struct OpenFileBody {
     path: Option<String>,
 }
 
-async fn open_file(State(s): State<AppState>, Json(body): Json<OpenFileBody>) -> Json<serde_json::Value> {
+async fn open_file(State(s): State<AppState>, headers: HeaderMap, Json(body): Json<OpenFileBody>) -> Json<serde_json::Value> {
+    let is_lan_client = headers.contains_key("x-filehub-lan-client");
     let open_mode = s.config.read().unwrap().open_mode.clone();
+    
+    if is_lan_client {
+        let url = body.path.map(|p| format!("/api/file-stream?path={}", urlencoding::encode(&p)));
+        return Json(serde_json::json!({ "success": url.is_some(), "streamUrl": url }));
+    }
+
     match open_mode.as_str() {
         "disabled" => Json(serde_json::json!({ "success": false })),
         "remote" => {
@@ -207,8 +214,12 @@ async fn open_terminal(State(s): State<AppState>, Json(body): Json<TerminalBody>
     if s.config.read().unwrap().open_mode != "local" {
         return Json(serde_json::json!({ "success": false }));
     }
-    let ok = body.work_dir.map(|d| open_terminal_native(&d)).unwrap_or(false);
-    Json(serde_json::json!({ "success": ok }))
+    let work_dir = body.work_dir.clone().unwrap_or_default();
+    let ok = body.work_dir.as_ref().map(|d| {
+        eprintln!("open_terminal API: work_dir='{}'", d);
+        open_terminal_native(d)
+    }).unwrap_or(false);
+    Json(serde_json::json!({ "success": ok, "debug": work_dir }))
 }
 
 async fn lan_info(State(s): State<AppState>) -> Json<serde_json::Value> {
@@ -277,18 +288,38 @@ async fn post_config(State(s): State<AppState>, Json(body): Json<serde_json::Val
 
 fn open_native(path: &str) -> bool {
     #[cfg(target_os = "windows")]
-    { Command::new("cmd").args(["/c", "start", "", path]).spawn().is_ok() }
+    {
+        use std::os::windows::process::CommandExt;
+        Command::new("cmd")
+            .args(["/c", "start", "", path])
+            .creation_flags(0x08000000)
+            .spawn()
+            .is_ok()
+    }
     #[cfg(target_os = "macos")]
-    { Command::new("open").arg(path).spawn().is_ok() }
+    {
+        Command::new("open").arg(path).spawn().is_ok()
+    }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    { Command::new("xdg-open").arg(path).spawn().is_ok() }
+    {
+        Command::new("xdg-open").arg(path).spawn().is_ok()
+    }
 }
 
 fn open_in_explorer_native(path: &str) -> bool {
     #[cfg(target_os = "windows")]
-    { Command::new("explorer").arg(format!("/select,{}", path)).spawn().is_ok() }
+    {
+        use std::os::windows::process::CommandExt;
+        Command::new("explorer")
+            .arg(format!("/select,{}", path))
+            .creation_flags(0x08000000)
+            .spawn()
+            .is_ok()
+    }
     #[cfg(target_os = "macos")]
-    { Command::new("open").args(["-R", path]).spawn().is_ok() }
+    {
+        Command::new("open").args(["-R", path]).spawn().is_ok()
+    }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     {
         let dir = Path::new(path).parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
@@ -297,15 +328,42 @@ fn open_in_explorer_native(path: &str) -> bool {
 }
 
 fn open_terminal_native(work_dir: &str) -> bool {
+    let dir = work_dir
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\\')
+        .to_string();
+    
+    eprintln!("open_terminal: work_dir='{}'", dir);
+    
+    if dir.is_empty() {
+        return false;
+    }
+    
     #[cfg(target_os = "windows")]
-    { Command::new("cmd").args(["/c", "start", "cmd", "/k", &format!("cd /d \"{}\"", work_dir)]).spawn().is_ok() }
+    {
+        use std::os::windows::process::CommandExt;
+        // Use start with /d flag to set initial directory
+        let ok = Command::new("cmd")
+            .args(["/c", "start", "cmd", "/k", &format!("cd /d {}", dir)])
+            .creation_flags(0x08000000)
+            .spawn()
+            .is_ok();
+        eprintln!("open_terminal: result={}", ok);
+        ok
+    }
     #[cfg(target_os = "macos")]
     {
         let script = format!("tell app \"Terminal\" to do script \"cd '{}'\"", work_dir);
         Command::new("osascript").args(["-e", &script]).spawn().is_ok()
     }
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    { Command::new("x-terminal-emulator").args(["-e", &format!("bash -c 'cd \"{}\" && $SHELL'", work_dir)]).spawn().is_ok() }
+    {
+        Command::new("x-terminal-emulator")
+            .args(["-e", &format!("bash -c 'cd \"{}\" && $SHELL'", work_dir)])
+            .spawn()
+            .is_ok()
+}
 }
 
 fn get_lan_ip() -> String {
